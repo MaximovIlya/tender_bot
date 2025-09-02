@@ -1,0 +1,118 @@
+# Environment and configuration files
+.env
+.env.local
+.env.*.local
+config.ini
+settings.ini
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+auction.db
+
+# Python cache and bytecode
+__pycache__/
+# Ignore Python bytecode files
+*.pyc
+*.pyo
+*.pyd
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs and temporary files
+*.log
+logs/
+*.tmp
+*.temp
+temp/
+
+# File uploads and storage
+files/
+uploads/
+media/
+documents/
+*.pdf
+*.doc
+*.docx
+
+# Test coverage
+.coverage
+.pytest_cache/
+.tox/
+htmlcov/
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
+
+# Documentation builds
+docs/_build/
+.readthedocs.yml
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# Runtime files
+*.pid
+*.sock
+celerybeat-schedule
+celerybeat.pid
+
+# Security keys and certificates
+*.pem
+*.key
+*.crt
+*.csr
+
+# Temporary Python files
+.mypy_cache/
+.dmypy.json
+dmypy.json
