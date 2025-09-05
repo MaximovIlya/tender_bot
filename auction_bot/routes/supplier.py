@@ -7,6 +7,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import Command
 from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
+from datetime import datetime, timezone
+from sqlalchemy.orm import selectinload
 
 from ..db import SessionLocal
 from ..models import User, Tender, TenderStatus, TenderParticipant, Bid
@@ -19,12 +21,13 @@ router = Router()
 class AuctionParticipation(StatesGroup):
     waiting_for_bid = State()
 
-@router.message(lambda message: message.text == "Активные тендеры")
+@router.message(F.text == "Активные тендеры")
 async def show_active_tenders(message: Message):
     """Показать активные тендеры"""
     user_id = message.from_user.id
-    
+
     async with SessionLocal() as session:
+        # Проверяем пользователя
         stmt = select(User).where(User.telegram_id == user_id)
         result = await session.execute(stmt)
         user = result.scalar_one_or_none()
@@ -32,30 +35,78 @@ async def show_active_tenders(message: Message):
         if not user or not user.org_name:
             await message.answer("Для участия в тендерах необходимо зарегистрироваться.")
             return
-        
-        # Получаем активные тендеры
-        stmt = select(Tender).where(
-            and_(
-                Tender.status == TenderStatus.active.value,
-                Tender.start_at <= datetime.now()
+
+        # Получаем активные тендеры (локальное время)
+        # ВАЖНО: Время в БД хранится в локальном времени, поэтому используем его для сравнения
+        now_utc = datetime.now(timezone.utc)
+        now_local = datetime.now()  # Локальное время системы
+        stmt = (
+            select(Tender)
+            .where(
+                and_(
+                    Tender.status == TenderStatus.active.value,
+                    Tender.start_at <= now_local  # Тендер уже начался (локальное время)
+                )
             )
-        ).order_by(Tender.start_at.desc())
-        
+            .options(
+                selectinload(Tender.participants),
+                selectinload(Tender.bids),
+            )
+            .order_by(Tender.start_at.desc())
+        )
         result = await session.execute(stmt)
         active_tenders = result.scalars().all()
+
+        # Получаем также тендеры, ожидающие активации
+        stmt_pending = (
+            select(Tender)
+            .where(
+                and_(
+                    Tender.status == TenderStatus.active_pending.value,
+                    Tender.start_at > now_local  # Тендер еще не начался (локальное время)
+                )
+            )
+            .options(
+                selectinload(Tender.participants),
+                selectinload(Tender.bids),
+            )
+            .order_by(Tender.start_at.asc())
+        )
+        result_pending = await session.execute(stmt_pending)
+        pending_tenders = result_pending.scalars().all()
         
-        if not active_tenders:
-            await message.answer("В данный момент нет активных тендеров.")
+        # Отладочная информация
+        print(f"DEBUG: Локальное время: {now_local.strftime('%d.%m.%Y %H:%M:%S')}")
+        print(f"DEBUG: UTC время: {now_utc.strftime('%d.%m.%Y %H:%M:%S')}")
+        print(f"DEBUG: Найдено активных тендеров: {len(active_tenders)}")
+        print(f"DEBUG: Найдено ожидающих тендеров: {len(pending_tenders)}")
+        
+        # Получаем ВСЕ тендеры для отладки
+        stmt_debug = select(Tender)
+        result_debug = await session.execute(stmt_debug)
+        all_tenders = result_debug.scalars().all()
+        print(f"DEBUG: Всего тендеров в БД: {len(all_tenders)}")
+        for t in all_tenders:
+            print(f"DEBUG: Тендер '{t.title}' - статус: {t.status}, время начала: {t.start_at}")
+
+        if not active_tenders and not pending_tenders:
+            await message.answer("В данный момент нет активных или предстоящих тендеров.")
             return
-        
+
         response = "🟢 Активные тендеры:\n\n"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+
         for tender in active_tenders:
-            # Проверяем, участвует ли поставщик в этом тендере
-            participant = await session.get(TenderParticipant, 
-                {"tender_id": tender.id, "supplier_id": user.id})
-            
+            # Проверяем участие пользователя
+            stmt = select(TenderParticipant).where(
+                TenderParticipant.tender_id == tender.id,
+                TenderParticipant.supplier_id == user.id
+            )
+            result = await session.execute(stmt)
+            participant = result.scalar_one_or_none()
+
             status = "✅ Участвуете" if participant else "🆕 Новый"
-            
+
             response += (
                 f"📋 <b>{tender.title}</b>\n"
                 f"💰 Текущая цена: {tender.current_price} ₽\n"
@@ -65,13 +116,8 @@ async def show_active_tenders(message: Message):
                 f"📈 Заявок: {len(tender.bids)}\n"
                 f"📊 Статус: {status}\n\n"
             )
-        
-        # Создаем клавиатуру для участия в тендерах
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[])
-        for tender in active_tenders:
-            participant = await session.get(TenderParticipant, 
-                {"tender_id": tender.id, "supplier_id": user.id})
-            
+
+            # Кнопки участия или подачи заявки
             if not participant:
                 keyboard.inline_keyboard.append([
                     InlineKeyboardButton(
@@ -80,13 +126,55 @@ async def show_active_tenders(message: Message):
                     )
                 ])
             else:
+                # Пользователь уже участвует - показываем кнопку подачи заявки
                 keyboard.inline_keyboard.append([
                     InlineKeyboardButton(
                         text=f"Подать заявку в '{tender.title}'",
                         callback_data=f"bid_tender_{tender.id}"
                     )
                 ])
-        
+
+        # Добавляем предстоящие тендеры
+        if pending_tenders:
+            response += "\n🕐 Предстоящие тендеры:\n\n"
+            
+            for tender in pending_tenders:
+                # Проверяем участие пользователя
+                stmt = select(TenderParticipant).where(
+                    TenderParticipant.tender_id == tender.id,
+                    TenderParticipant.supplier_id == user.id
+                )
+                result = await session.execute(stmt)
+                participant = result.scalar_one_or_none()
+
+                status = "✅ Участвуете" if participant else "🆕 Новый"
+
+                response += (
+                    f"📋 <b>{tender.title}</b>\n"
+                    f"💰 Стартовая цена: {tender.start_price} ₽\n"
+                    f"📅 Начало: {tender.start_at.strftime('%d.%m.%Y %H:%M')}\n"
+                    f"📝 Описание: {tender.description[:100]}...\n"
+                    f"🏆 Участников: {len(tender.participants)}\n"
+                    f"📊 Статус: {status}\n\n"
+                )
+
+                # Кнопки участия для предстоящих тендеров
+                if not participant:
+                    keyboard.inline_keyboard.append([
+                        InlineKeyboardButton(
+                            text=f"Участвовать в '{tender.title}'",
+                            callback_data=f"join_tender_{tender.id}"
+                        )
+                    ])
+                else:
+                    # Пользователь уже участвует в предстоящем тендере
+                    keyboard.inline_keyboard.append([
+                        InlineKeyboardButton(
+                            text=f"Подать заявку в '{tender.title}' (ожидает активации)",
+                            callback_data=f"bid_tender_{tender.id}"
+                        )
+                    ])
+
         await message.answer(response, reply_markup=keyboard)
 
 @router.callback_query(lambda c: c.data.startswith("join_tender_"))
@@ -96,24 +184,31 @@ async def join_tender(callback: CallbackQuery):
     user_id = callback.from_user.id
     
     async with SessionLocal() as session:
-        user = await session.get(User, user_id)
+        stmt = select(User).where(User.telegram_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        
         if not user or not user.org_name:
             await callback.answer("Для участия необходимо зарегистрироваться.")
             return
         
         tender = await session.get(Tender, tender_id)
-        if not tender or tender.status != TenderStatus.active.value:
+        if not tender or tender.status not in [TenderStatus.active.value, TenderStatus.active_pending.value]:
             await callback.answer("Тендер недоступен.")
             return
         
         # Проверяем, не участвует ли уже поставщик
-        existing_participant = await session.get(TenderParticipant, 
-            {"tender_id": tender_id, "supplier_id": user.id})
-        
+        stmt = select(TenderParticipant).where(
+            TenderParticipant.tender_id == tender_id,
+            TenderParticipant.supplier_id == user.id
+        )
+        result = await session.execute(stmt)
+        existing_participant = result.scalar_one_or_none()
+
         if existing_participant:
             await callback.answer("Вы уже участвуете в этом тендере.")
             return
-        
+                
         # Добавляем участника
         participant = TenderParticipant(
             tender_id=tender_id,
@@ -122,12 +217,21 @@ async def join_tender(callback: CallbackQuery):
         session.add(participant)
         await session.commit()
         
+        # Создаем клавиатуру с кнопкой подачи заявки
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"Подать заявку в '{tender.title}'",
+                callback_data=f"bid_tender_{tender.id}"
+            )]
+        ])
+        
         await callback.message.edit_text(
             f"✅ Вы присоединились к тендеру!\n\n"
             f"📋 {tender.title}\n"
             f"💰 Текущая цена: {tender.current_price} ₽\n"
             f"📅 Начало: {tender.start_at.strftime('%d.%m.%Y %H:%M')}\n\n"
-            f"Теперь вы можете подавать заявки на снижение цены."
+            f"Теперь вы можете подавать заявки на снижение цены.",
+            reply_markup=keyboard
         )
 
 @router.callback_query(lambda c: c.data.startswith("bid_tender_"))
@@ -137,22 +241,35 @@ async def start_bidding(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     
     async with SessionLocal() as session:
-        user = await session.get(User, user_id)
+        # Получаем пользователя по telegram_id
+        stmt = select(User).where(User.telegram_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        
         if not user or not user.org_name:
             await callback.answer("Для участия необходимо зарегистрироваться.")
             return
         
         tender = await session.get(Tender, tender_id)
-        if not tender or tender.status != TenderStatus.active.value:
+        if not tender or tender.status not in [TenderStatus.active.value, TenderStatus.active_pending.value]:
             await callback.answer("Тендер недоступен.")
             return
         
         # Проверяем участие
-        participant = await session.get(TenderParticipant, 
-            {"tender_id": tender_id, "supplier_id": user.id})
+        stmt = select(TenderParticipant).where(
+            TenderParticipant.tender_id == tender_id,
+            TenderParticipant.supplier_id == user.id
+        )
+        result = await session.execute(stmt)
+        participant = result.scalar_one_or_none()
         
         if not participant:
             await callback.answer("Сначала присоединитесь к тендеру.")
+            return
+        
+        # Проверяем, что тендер активен (не ожидает активации)
+        if tender.status == TenderStatus.active_pending.value:
+            await callback.answer("Тендер еще не начался. Дождитесь активации.")
             return
         
         # Проверяем, не истекло ли время аукциона
@@ -188,8 +305,14 @@ async def process_bid(message: Message, state: FSMContext):
     
     async with SessionLocal() as session:
         tender = await session.get(Tender, tender_id)
-        if not tender or tender.status != TenderStatus.active.value:
-            await message.answer("Тендер недоступен.")
+        if not tender or tender.status not in [TenderStatus.active.value, TenderStatus.active_pending.value]:
+            await message.answer("Тендер недоступлен.")
+            await state.clear()
+            return
+        
+        # Проверяем, что тендер активен (не ожидает активации)
+        if tender.status == TenderStatus.active_pending.value:
+            await message.answer("Тендер еще не начался. Дождитесь активации.")
             await state.clear()
             return
         
@@ -224,7 +347,9 @@ async def process_bid(message: Message, state: FSMContext):
         await session.commit()
         
         # Получаем пользователя для уведомлений
-        user = await session.get(User, user_id)
+        stmt = select(User).where(User.telegram_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
         
         # Уведомляем всех участников о новой заявке
         await notify_participants_about_bid(session, tender, bid, user)
@@ -266,12 +391,135 @@ async def notify_participants_about_bid(session: AsyncSession, tender: Tender, b
     for participant in participants:
         if participant.supplier_id != bidder.id:  # Не уведомляем подавшего заявку
             try:
-                await session.bot.send_message(
-                    participant.supplier.telegram_id,
-                    notification_text
-                )
+                # Получаем пользователя-участника для отправки уведомления
+                stmt = select(User).where(User.id == participant.supplier_id)
+                result = await session.execute(stmt)
+                participant_user = result.scalar_one_or_none()
+                
+                if participant_user:
+                    await session.bot.send_message(
+                        participant_user.telegram_id,
+                        notification_text
+                    )
             except Exception as e:
                 print(f"Ошибка отправки уведомления: {e}")
+
+@router.message(Command("debug_tenders"))
+async def debug_tenders(message: Message):
+    """Отладочная команда для проверки тендеров"""
+    user_id = message.from_user.id
+    
+    async with SessionLocal() as session:
+        # Проверяем пользователя
+        stmt = select(User).where(User.telegram_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        
+        if not user or not user.org_name:
+            await message.answer("Для участия в тендерах необходимо зарегистрироваться.")
+            return
+        
+        # Получаем текущее время в UTC и локальное время
+        now_utc = datetime.now(timezone.utc)
+        now_local = datetime.now()  # Локальное время системы
+        
+        # Получаем ВСЕ тендеры
+        stmt = select(Tender).order_by(Tender.created_at.desc())
+        result = await session.execute(stmt)
+        all_tenders = result.scalars().all()
+        
+        if not all_tenders:
+            await message.answer("В базе данных нет тендеров.")
+            return
+        
+        response = f"🔍 Отладочная информация о тендерах\n"
+        response += f"📅 Локальное время: {now_local.strftime('%d.%m.%Y %H:%M:%S')}\n"
+        response += f"🌍 UTC время: {now_utc.strftime('%d.%m.%Y %H:%M:%S')}\n"
+        response += f"📊 Всего тендеров: {len(all_tenders)}\n\n"
+        
+        for tender in all_tenders:
+            status_emoji = {
+                TenderStatus.draft.value: "📝",
+                TenderStatus.active_pending.value: "⏳",
+                TenderStatus.active.value: "🟢",
+                TenderStatus.closed.value: "🔴",
+                TenderStatus.cancelled.value: "❌"
+            }.get(tender.status, "❓")
+            
+            status_text = {
+                TenderStatus.draft.value: "Черновик",
+                TenderStatus.active_pending.value: "Ожидает активации",
+                TenderStatus.active.value: "Активен",
+                TenderStatus.closed.value: "Завершен",
+                TenderStatus.cancelled.value: "Отменен"
+            }.get(tender.status, "Неизвестно")
+            
+            # Проверяем, должен ли тендер быть активным
+            should_be_active = (
+                tender.status == TenderStatus.active_pending.value and 
+                tender.start_at <= now_local
+            )
+            
+            response += (
+                f"{status_emoji} <b>{tender.title}</b>\n"
+                f"   ID: {tender.id}\n"
+                f"   Статус: {status_text}\n"
+                f"   Время начала: {tender.start_at.strftime('%d.%m.%Y %H:%M:%S') if tender.start_at else 'Не указано'}\n"
+                f"   Создан: {tender.created_at.strftime('%d.%m.%Y %H:%M:%S')}\n"
+            )
+            
+            if should_be_active:
+                response += f"   ⚠️ ДОЛЖЕН БЫТЬ АКТИВНЫМ!\n"
+            
+            response += "\n"
+        
+        await message.answer(response, reply_markup=menu_supplier)
+
+@router.message(Command("force_activate"))
+async def force_activate_tenders(message: Message):
+    """Принудительная активация тендеров (для отладки)"""
+    user_id = message.from_user.id
+    
+    async with SessionLocal() as session:
+        # Проверяем пользователя
+        stmt = select(User).where(User.telegram_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        
+        if not user or not user.org_name:
+            await message.answer("Для участия в тендерах необходимо зарегистрироваться.")
+            return
+        
+        # Получаем текущее время в UTC и локальное время
+        now_utc = datetime.now(timezone.utc)
+        now_local = datetime.now()  # Локальное время системы
+        
+        # Ищем тендеры, которые должны быть активными
+        stmt = select(Tender).where(
+            Tender.status == TenderStatus.active_pending.value,
+            Tender.start_at <= now_local
+        )
+        result = await session.execute(stmt)
+        pending_tenders = result.scalars().all()
+        
+        if not pending_tenders:
+            await message.answer("Нет тендеров для принудительной активации.")
+            return
+        
+        response = f"🔧 Принудительная активация тендеров\n"
+        response += f"📅 Локальное время: {now_local.strftime('%d.%m.%Y %H:%M:%S')}\n"
+        response += f"🌍 UTC время: {now_utc.strftime('%d.%m.%Y %H:%M:%S')}\n\n"
+        
+        for tender in pending_tenders:
+            # Активируем тендер
+            tender.status = TenderStatus.active.value
+            tender.current_price = tender.start_price
+            response += f"✅ Активирован: {tender.title}\n"
+        
+        await session.commit()
+        response += f"\n🎉 Активировано тендеров: {len(pending_tenders)}"
+        
+        await message.answer(response, reply_markup=menu_supplier)
 
 @router.message(Command("my_bids"))
 async def show_my_bids(message: Message):
@@ -279,7 +527,11 @@ async def show_my_bids(message: Message):
     user_id = message.from_user.id
     
     async with SessionLocal() as session:
-        user = await session.get(User, user_id)
+        # Получаем пользователя по telegram_id
+        stmt = select(User).where(User.telegram_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        
         if not user or not user.org_name:
             await message.answer("Для участия в тендерах необходимо зарегистрироваться.")
             return

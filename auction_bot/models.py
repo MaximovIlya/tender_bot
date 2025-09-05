@@ -38,6 +38,7 @@ class User(Base):
 
 class TenderStatus(str, enum.Enum):
     draft = "draft"
+    active_pending = "active_pending"
     active = "active"
     closed = "closed"
     cancelled = "cancelled"
@@ -58,7 +59,7 @@ class Tender(Base):
     # auction fields
     last_bid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     current_price: Mapped[float] = mapped_column(Float)
-    min_bid_decrease: Mapped[float] = mapped_column(Float, default=0.01)  # минимальное снижение цены
+    min_bid_decrease: Mapped[float] = mapped_column(Float, default=10000.0)  # минимальное снижение цены
     
     # relationships
     organizer: Mapped[User] = relationship(back_populates="tenders")

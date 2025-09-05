@@ -18,4 +18,5 @@ menu_organizer = ReplyKeyboardMarkup(keyboard=[
 
 menu_admin = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="Пользователи"), KeyboardButton(text="Назначить роль")],
+    [KeyboardButton(text="Одобрить тендер"), KeyboardButton(text="Статус тендеров")],
 ], resize_keyboard=True)

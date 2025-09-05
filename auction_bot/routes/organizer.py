@@ -7,6 +7,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import Command
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from ..db import SessionLocal
 from ..models import User, Tender, TenderStatus, TenderParticipant
@@ -131,9 +132,10 @@ async def process_tender_conditions(message: Message, state: FSMContext):
             current_price=user_data['current_price'],
             start_at=user_data['start_at'],
             conditions_path=conditions_path,
-            organizer_id=user.id
+            organizer_id=user.id,
+            status=TenderStatus.draft.value  
         )
-        
+                
         session.add(tender)
         await session.commit()
         
@@ -149,37 +151,50 @@ async def process_tender_conditions(message: Message, state: FSMContext):
     
     await state.clear()
 
-@router.message(lambda message: message.text == "Мои тендеры")
+
+
+@router.message(F.text == "Мои тендеры")
 async def show_my_tenders(message: Message):
     """Показать тендеры организатора"""
     user_id = message.from_user.id
-    
+
     async with SessionLocal() as session:
+        # Находим пользователя по telegram_id
         stmt = select(User).where(User.telegram_id == user_id)
         result = await session.execute(stmt)
         user = result.scalar_one_or_none()
+
         if not user or user.role != "organizer":
             await message.answer("У вас нет прав для просмотра тендеров.")
             return
-        
-        # Получаем тендеры организатора
-        stmt = select(Tender).where(Tender.organizer_id == user.id).order_by(Tender.created_at.desc())
+
+        # Получаем тендеры организатора сразу с участниками и заявками
+        stmt = (
+            select(Tender)
+            .where(Tender.organizer_id == user.id)
+            .options(
+                selectinload(Tender.participants),
+                selectinload(Tender.bids),
+            )
+            .order_by(Tender.created_at.desc())
+        )
         result = await session.execute(stmt)
         tenders = result.scalars().all()
-        
+
         if not tenders:
             await message.answer("У вас пока нет тендеров.")
             return
-        
+
+        # Формируем ответ
         response = "📋 Ваши тендеры:\n\n"
         for tender in tenders:
             status_emoji = {
                 "draft": "📝",
                 "active": "🟢",
                 "closed": "🔴",
-                "cancelled": "❌"
+                "cancelled": "❌",
             }
-            
+
             response += (
                 f"{status_emoji.get(tender.status, '❓')} <b>{tender.title}</b>\n"
                 f"💰 Цена: {tender.current_price} ₽\n"
@@ -188,7 +203,7 @@ async def show_my_tenders(message: Message):
                 f"🏆 Участников: {len(tender.participants)}\n"
                 f"📈 Заявок: {len(tender.bids)}\n\n"
             )
-        
+
         await message.answer(response, reply_markup=menu_organizer)
 
 @router.message(Command("start_auction"))

@@ -253,6 +253,107 @@ async def system_info(message: Message):
     
     await message.answer(info_text)
 
+@router.message(lambda message: message.text == "Одобрить тендер")
+async def approve_tender(message: Message):
+    user_id = message.from_user.id
+
+    async with SessionLocal() as session:
+        stmt = select(User).where(User.telegram_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+
+        if user_id not in settings.ADMIN_IDS:
+            await message.answer("У вас нет прав для одобрения тендеров.")
+            return
+
+        # Получаем все черновики
+        stmt = select(Tender).where(Tender.status == TenderStatus.draft.value)
+        result = await session.execute(stmt)
+        drafts = result.scalars().all()
+
+        if not drafts:
+            await message.answer("Нет тендеров для одобрения.")
+            return
+
+        response = "📝 Тендеры в черновиках:\n\n"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+
+        for t in drafts:
+            response += f"{t.id}: {t.title} | Начало: {t.start_at.strftime('%d.%m.%Y %H:%M')}\n"
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(
+                    text=f"Одобрить '{t.title}'",
+                    callback_data=f"approve_tender_{t.id}"
+                )
+            ])
+
+        await message.answer(response, reply_markup=keyboard)
+
+@router.message(lambda message: message.text == "Статус тендеров")
+async def show_tender_statuses(message: Message):
+    """Показать статусы всех тендеров"""
+    user_id = message.from_user.id
+
+    if user_id not in settings.ADMIN_IDS:
+        await message.answer("У вас нет прав для просмотра статусов тендеров.")
+        return
+
+    async with SessionLocal() as session:
+        # Получаем все тендеры с их статусами
+        stmt = select(Tender).order_by(Tender.created_at.desc())
+        result = await session.execute(stmt)
+        tenders = result.scalars().all()
+
+        if not tenders:
+            await message.answer("Нет тендеров в системе.")
+            return
+
+        response = "📊 Статусы тендеров:\n\n"
+        
+        for t in tenders:
+            status_emoji = {
+                TenderStatus.draft.value: "📝",
+                TenderStatus.active_pending.value: "⏳",
+                TenderStatus.active.value: "🟢",
+                TenderStatus.closed.value: "🔴",
+                TenderStatus.cancelled.value: "❌"
+            }.get(t.status, "❓")
+            
+            status_text = {
+                TenderStatus.draft.value: "Черновик",
+                TenderStatus.active_pending.value: "Ожидает активации",
+                TenderStatus.active.value: "Активен",
+                TenderStatus.closed.value: "Завершен",
+                TenderStatus.cancelled.value: "Отменен"
+            }.get(t.status, "Неизвестно")
+            
+            response += (
+                f"{status_emoji} <b>{t.title}</b>\n"
+                f"   ID: {t.id}\n"
+                f"   Статус: {status_text}\n"
+                f"   Начало: {t.start_at.strftime('%d.%m.%Y %H:%M') if t.start_at else 'Не указано'}\n"
+                f"   Создан: {t.created_at.strftime('%d.%m.%Y %H:%M')}\n\n"
+            )
+
+        await message.answer(response)
+
+
+@router.callback_query(lambda c: c.data.startswith("approve_tender_"))
+async def process_approve_tender(callback: CallbackQuery):
+    tender_id = int(callback.data.split("_")[-1])
+
+    async with SessionLocal() as session:
+        tender = await session.get(Tender, tender_id)
+        if not tender:
+            await callback.answer("Тендер не найден.", show_alert=True)
+            return
+
+        # Тендер переходит в статус "ожидающий активации"
+        tender.status = TenderStatus.active_pending.value
+        await session.commit()
+
+    await callback.message.edit_text(f"✅ Тендер '{tender.title}' одобрен! Он будет активирован в {tender.start_at.strftime('%d.%m.%Y %H:%M')}")
+
 def register_handlers(dp):
     """Регистрация хендлеров"""
     dp.include_router(router)

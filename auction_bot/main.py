@@ -16,6 +16,7 @@ from sqlalchemy import select
 from .routes import admin, organizer, supplier, common, auctions
 from .services.timers import AuctionTimer
 from .services.reports import ReportService
+from .services.activate_pending_tenders import activate_pending_tenders
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -54,86 +55,59 @@ class AuctionParticipation(StatesGroup):
 async def cmd_start(message: Message):
     """Начальная команда бота"""
     user_id = message.from_user.id
-    
+
     async with SessionLocal() as session:
-        # Проверяем, зарегистрирован ли пользователь
         from .models import User
         stmt = select(User).where(User.telegram_id == user_id)
         result = await session.execute(stmt)
         user = result.scalar_one_or_none()
-        
+
+        # Если пользователя ещё нет
         if not user:
-            # Создаем нового пользователя
-            user = User(
-                telegram_id=user_id,
-                username=message.from_user.username,
-                role="supplier"
-            )
-            session.add(user)
-            await session.commit()
-            
-            await message.answer(
-                "Добро пожаловать в систему аукционов! 🏛️\n\n"
-                "Выберите ваш статус:",
-                reply_markup=menu_main
-            )
-        else:
-            if user.banned:
-                await message.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
-                return
-                
-            if user.role == "admin":
-                await message.answer("Панель администратора", reply_markup=menu_admin)
-            elif user.role == "organizer":
+            # Если это организатор (по ID из настроек)
+            if user_id == settings.ORGANIZER_ID:
+                user = User(
+                    telegram_id=user_id,
+                    username=message.from_user.username,
+                    role="organizer"
+                )
+                session.add(user)
+                await session.commit()
                 await message.answer("Панель организатора", reply_markup=menu_organizer)
-            elif user.role == "supplier":
-                if user.org_name:  # Если поставщик уже зарегистрирован
-                    await message.answer("Панель поставщика", reply_markup=menu_supplier)
-                else:
-                    await message.answer(
-                        "Для участия в тендерах необходимо зарегистрироваться.\n"
-                        "Нажмите кнопку 'Регистрация'",
-                        reply_markup=menu_supplier
-                    )
+                return
+            else:
+                # Все остальные по умолчанию — поставщики
+                user = User(
+                    telegram_id=user_id,
+                    username=message.from_user.username,
+                    role="supplier"
+                )
+                session.add(user)
+                await session.commit()
 
-@dp.message(lambda message: message.text == "Я поставщик")
-async def supplier_menu(message: Message):
-    """Меню поставщика"""
-    user_id = message.from_user.id
-    
-    async with SessionLocal() as session:
-        from .models import User
-        stmt = select(User).where(User.telegram_id == user_id)
-        result = await session.execute(stmt)
-        user = result.scalar_one_or_none()
-        
-        if user and user.org_name:
-            await message.answer("Панель поставщика", reply_markup=menu_supplier)
-        else:
-            await message.answer(
-                "Для участия в тендерах необходимо зарегистрироваться.\n"
-                "Нажмите кнопку 'Регистрация'",
-                reply_markup=menu_supplier
-            )
+        # Если пользователь заблокирован
+        if user.banned:
+            await message.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
+            return
 
-@dp.message(lambda message: message.text == "Я организатор")
-async def organizer_menu(message: Message):
-    """Меню организатора"""
-    user_id = message.from_user.id
-    
-    async with SessionLocal() as session:
-        from .models import User
-        stmt = select(User).where(User.telegram_id == user_id)
-        result = await session.execute(stmt)
-        user = result.scalar_one_or_none()
-        
-        if user and user.role == "organizer":
+        # Если это организатор
+        if user.role == "organizer":
             await message.answer("Панель организатора", reply_markup=menu_organizer)
-        else:
-            await message.answer(
-                "Для создания тендеров необходимо получить роль организатора.\n"
-                "Обратитесь к администратору."
-            )
+            return
+
+        # Если это поставщик
+        if user.role == "supplier":
+            if user.org_name:  # Уже зарегистрирован
+                await message.answer("Панель поставщика", reply_markup=menu_supplier)
+            else:
+                await message.answer(
+                    "Для участия в тендерах необходимо зарегистрироваться.\n"
+                    "Нажмите кнопку 'Регистрация'",
+                    reply_markup=menu_supplier
+                )
+
+
+
 
 @dp.message(lambda message: message.text == "Регистрация")
 async def start_registration(message: Message, state: FSMContext):
@@ -223,6 +197,8 @@ async def process_fio(message: Message, state: FSMContext):
     
     await state.clear()
 
+
+
 async def main():
     """Главная функция"""
     # Инициализация базы данных
@@ -234,6 +210,8 @@ async def main():
     supplier.register_handlers(dp)
     common.register_handlers(dp)
     auctions.register_handlers(dp)
+
+    asyncio.create_task(activate_pending_tenders())
     
     # Запуск бота
     logger.info("Бот запущен")
@@ -241,3 +219,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
