@@ -13,6 +13,7 @@ menu_supplier = ReplyKeyboardMarkup(keyboard=[
 
 menu_organizer = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="Создать тендер"), KeyboardButton(text="Мои тендеры")],
+    [KeyboardButton(text="Управление доступом")],
 ], resize_keyboard=True)
 
 

@@ -17,6 +17,7 @@ from .routes import admin, organizer, supplier, common, auctions
 from .services.timers import AuctionTimer
 from .services.reports import ReportService
 from .services.activate_pending_tenders import activate_pending_tenders
+from .services import bids
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -199,17 +200,23 @@ async def process_fio(message: Message, state: FSMContext):
 
 
 
-async def main():
-    """Главная функция"""
-    # Инициализация базы данных
-    await init_db()
-    
-    # Регистрация роутов
+def register_handlers(dp: Dispatcher):
+    """Регистрация всех хендлеров"""
     admin.register_handlers(dp)
     organizer.register_handlers(dp)
     supplier.register_handlers(dp)
     common.register_handlers(dp)
     auctions.register_handlers(dp)
+    dp.include_router(bids.router)
+
+async def main():
+    """Главная функция"""
+    # Инициализация базы данных
+    await init_db()
+    
+    
+
+    register_handlers(dp)
 
     asyncio.create_task(activate_pending_tenders())
     
@@ -220,3 +227,4 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
     
+

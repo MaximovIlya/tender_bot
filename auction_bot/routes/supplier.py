@@ -11,9 +11,12 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import selectinload
 
 from ..db import SessionLocal
-from ..models import User, Tender, TenderStatus, TenderParticipant, Bid
+from ..models import User, Tender, TenderStatus, TenderParticipant, Bid, TenderAccess
 from ..keyboards import menu_supplier
 from ..services.timers import AuctionTimer
+from ..bot import bot
+
+auction_timer = AuctionTimer(bot)
 
 router = Router()
 
@@ -36,16 +39,20 @@ async def show_active_tenders(message: Message):
             await message.answer("Для участия в тендерах необходимо зарегистрироваться.")
             return
 
-        # Получаем активные тендеры (локальное время)
+        # Получаем активные тендеры с учетом доступа (локальное время)
         # ВАЖНО: Время в БД хранится в локальном времени, поэтому используем его для сравнения
         now_utc = datetime.now(timezone.utc)
         now_local = datetime.now()  # Локальное время системы
+        
+        # Получаем тендеры, к которым у пользователя есть доступ
         stmt = (
             select(Tender)
+            .join(TenderAccess, Tender.id == TenderAccess.tender_id)
             .where(
                 and_(
                     Tender.status == TenderStatus.active.value,
-                    Tender.start_at <= now_local  # Тендер уже начался (локальное время)
+                    Tender.start_at <= now_local,  # Тендер уже начался (локальное время)
+                    TenderAccess.supplier_id == user.id  # У пользователя есть доступ
                 )
             )
             .options(
@@ -57,13 +64,15 @@ async def show_active_tenders(message: Message):
         result = await session.execute(stmt)
         active_tenders = result.scalars().all()
 
-        # Получаем также тендеры, ожидающие активации
+        # Получаем также тендеры, ожидающие активации, с учетом доступа
         stmt_pending = (
             select(Tender)
+            .join(TenderAccess, Tender.id == TenderAccess.tender_id)
             .where(
                 and_(
                     Tender.status == TenderStatus.active_pending.value,
-                    Tender.start_at > now_local  # Тендер еще не начался (локальное время)
+                    Tender.start_at > now_local,  # Тендер еще не начался (локальное время)
+                    TenderAccess.supplier_id == user.id  # У пользователя есть доступ
                 )
             )
             .options(
@@ -90,7 +99,10 @@ async def show_active_tenders(message: Message):
             print(f"DEBUG: Тендер '{t.title}' - статус: {t.status}, время начала: {t.start_at}")
 
         if not active_tenders and not pending_tenders:
-            await message.answer("В данный момент нет активных или предстоящих тендеров.")
+            await message.answer(
+                "В данный момент нет активных или предстоящих тендеров, к которым у вас есть доступ.\n\n"
+                "Обратитесь к организатору для получения доступа к тендерам."
+            )
             return
 
         response = "🟢 Активные тендеры:\n\n"
@@ -197,6 +209,18 @@ async def join_tender(callback: CallbackQuery):
             await callback.answer("Тендер недоступен.")
             return
         
+        # Проверяем, есть ли у пользователя доступ к тендеру
+        stmt = select(TenderAccess).where(
+            TenderAccess.tender_id == tender_id,
+            TenderAccess.supplier_id == user.id
+        )
+        result = await session.execute(stmt)
+        access = result.scalar_one_or_none()
+        
+        if not access:
+            await callback.answer("У вас нет доступа к этому тендеру. Обратитесь к организатору.")
+            return
+        
         # Проверяем, не участвует ли уже поставщик
         stmt = select(TenderParticipant).where(
             TenderParticipant.tender_id == tender_id,
@@ -255,6 +279,18 @@ async def start_bidding(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Тендер недоступен.")
             return
         
+        # Проверяем, есть ли у пользователя доступ к тендеру
+        stmt = select(TenderAccess).where(
+            TenderAccess.tender_id == tender_id,
+            TenderAccess.supplier_id == user.id
+        )
+        result = await session.execute(stmt)
+        access = result.scalar_one_or_none()
+        
+        if not access:
+            await callback.answer("У вас нет доступа к этому тендеру. Обратитесь к организатору.")
+            return
+        
         # Проверяем участие
         stmt = select(TenderParticipant).where(
             TenderParticipant.tender_id == tender_id,
@@ -272,10 +308,7 @@ async def start_bidding(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Тендер еще не начался. Дождитесь активации.")
             return
         
-        # Проверяем, не истекло ли время аукциона
-        if tender.last_bid_at and datetime.now() - tender.last_bid_at > timedelta(minutes=5):
-            await callback.answer("Время подачи заявок истекло.")
-            return
+        
         
         await state.update_data(tender_id=tender_id)
         await state.set_state(AuctionParticipation.waiting_for_bid)
@@ -310,6 +343,29 @@ async def process_bid(message: Message, state: FSMContext):
             await state.clear()
             return
         
+        # Получаем пользователя для проверки доступа
+        stmt = select(User).where(User.telegram_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        
+        if not user:
+            await message.answer("Пользователь не найден.")
+            await state.clear()
+            return
+        
+        # Проверяем, есть ли у пользователя доступ к тендеру
+        stmt = select(TenderAccess).where(
+            TenderAccess.tender_id == tender_id,
+            TenderAccess.supplier_id == user.id
+        )
+        result = await session.execute(stmt)
+        access = result.scalar_one_or_none()
+        
+        if not access:
+            await message.answer("У вас нет доступа к этому тендеру. Обратитесь к организатору.")
+            await state.clear()
+            return
+        
         # Проверяем, что тендер активен (не ожидает активации)
         if tender.status == TenderStatus.active_pending.value:
             await message.answer("Тендер еще не начался. Дождитесь активации.")
@@ -335,7 +391,7 @@ async def process_bid(message: Message, state: FSMContext):
         # Создаем заявку
         bid = Bid(
             tender_id=tender_id,
-            supplier_id=user_id,
+            supplier_id=user.id,
             amount=bid_amount
         )
         session.add(bid)
@@ -345,6 +401,8 @@ async def process_bid(message: Message, state: FSMContext):
         tender.last_bid_at = datetime.now()
         
         await session.commit()
+
+        await auction_timer.reset_timer_for_tender(tender.id)
         
         # Получаем пользователя для уведомлений
         stmt = select(User).where(User.telegram_id == user_id)
@@ -358,7 +416,7 @@ async def process_bid(message: Message, state: FSMContext):
             f"✅ Заявка подана!\n\n"
             f"📋 Тендер: {tender.title}\n"
             f"💰 Ваша цена: {bid_amount} ₽\n"
-            f"📅 Время подачи: {bid.created_at.strftime('%H:%M:%S')}\n\n"
+            f"📅 Время подачи: {tender.last_bid_at.strftime('%H:%M:%S')}\n\n"
             f"Аукцион продолжается!",
             reply_markup=menu_supplier
         )
@@ -397,10 +455,10 @@ async def notify_participants_about_bid(session: AsyncSession, tender: Tender, b
                 participant_user = result.scalar_one_or_none()
                 
                 if participant_user:
-                    await session.bot.send_message(
-                        participant_user.telegram_id,
-                        notification_text
-                    )
+                    await bot.send_message(
+                    participant_user.telegram_id,
+                    notification_text
+                )
             except Exception as e:
                 print(f"Ошибка отправки уведомления: {e}")
 

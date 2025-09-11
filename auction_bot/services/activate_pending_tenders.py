@@ -49,4 +49,4 @@ async def activate_pending_tenders():
         except Exception as e:
             logger.error(f"❌ Ошибка в activate_pending_tenders: {e}")
             
-        await asyncio.sleep(60)  # проверка каждые 60 секунд
+        await asyncio.sleep(30)  # проверка каждые 30 секунд

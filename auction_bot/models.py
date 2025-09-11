@@ -65,6 +65,7 @@ class Tender(Base):
     organizer: Mapped[User] = relationship(back_populates="tenders")
     bids: Mapped[list["Bid"]] = relationship(back_populates="tender", order_by="Bid.created_at")
     participants: Mapped[list["TenderParticipant"]] = relationship(back_populates="tender")
+    access_grants: Mapped[list["TenderAccess"]] = relationship()
 
 
 class TenderParticipant(Base):
@@ -76,6 +77,18 @@ class TenderParticipant(Base):
     
     # relationships
     tender: Mapped[Tender] = relationship(back_populates="participants")
+    supplier: Mapped[User] = relationship()
+
+
+class TenderAccess(Base):
+    __tablename__ = "tender_access"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    tender_id: Mapped[int] = mapped_column(ForeignKey("tenders.id"))
+    supplier_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    granted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    
+    # relationships
+    tender: Mapped[Tender] = relationship()
     supplier: Mapped[User] = relationship()
 
 
