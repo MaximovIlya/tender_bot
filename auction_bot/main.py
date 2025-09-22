@@ -18,6 +18,8 @@ from .services.timers import AuctionTimer
 from .services.reports import ReportService
 from .services.activate_pending_tenders import activate_pending_tenders
 from .services import bids
+from .services import timers
+from .routes import organizer
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -29,7 +31,9 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 # Инициализация сервисов
-auction_timer = AuctionTimer(bot)
+auction_timer = timers.AuctionTimer(bot)
+organizer.set_timer(auction_timer)
+supplier.set_timer(auction_timer)
 report_service = ReportService()
 
 # Состояния для регистрации поставщика
@@ -63,9 +67,21 @@ async def cmd_start(message: Message):
         result = await session.execute(stmt)
         user = result.scalar_one_or_none()
 
-        # Если пользователя ещё нет
+        
         if not user:
-            # Если это организатор (по ID из настроек)
+            # Если это админ
+            # if user_id in settings.ADMIN_IDS:
+            #     user = User(
+            #         telegram_id=user_id,
+            #         username=message.from_user.username,
+            #         role="admin"
+            #     )
+            #     session.add(user)
+            #     await session.commit()
+            #     await message.answer("Панель администратора", reply_markup=menu_admin)
+            #     return
+
+            # Если это организатор
             if user_id == settings.ORGANIZER_ID:
                 user = User(
                     telegram_id=user_id,
@@ -76,15 +92,16 @@ async def cmd_start(message: Message):
                 await session.commit()
                 await message.answer("Панель организатора", reply_markup=menu_organizer)
                 return
-            else:
-                # Все остальные по умолчанию — поставщики
-                user = User(
-                    telegram_id=user_id,
-                    username=message.from_user.username,
-                    role="supplier"
-                )
-                session.add(user)
-                await session.commit()
+
+            # Все остальные по умолчанию — поставщики
+            user = User(
+                telegram_id=user_id,
+                username=message.from_user.username,
+                role="supplier"
+            )
+            session.add(user)
+            await session.commit()
+
 
         # Если пользователь заблокирован
         if user.banned:
@@ -99,12 +116,12 @@ async def cmd_start(message: Message):
         # Если это поставщик
         if user.role == "supplier":
             if user.org_name:  # Уже зарегистрирован
-                await message.answer("Панель поставщика", reply_markup=menu_supplier)
+                await message.answer("Панель поставщика", reply_markup=menu_supplier_registered)
             else:
                 await message.answer(
                     "Для участия в тендерах необходимо зарегистрироваться.\n"
                     "Нажмите кнопку 'Регистрация'",
-                    reply_markup=menu_supplier
+                    reply_markup=menu_supplier_unregistered
                 )
 
 
@@ -191,7 +208,7 @@ async def process_fio(message: Message, state: FSMContext):
                 f"Телефон: {user_data['phone']}\n"
                 f"ФИО: {user_data['fio']}\n\n"
                 f"Теперь вы можете участвовать в тендерах!",
-                reply_markup=menu_supplier
+                reply_markup=menu_supplier_registered
             )
         else:
             await message.answer("Ошибка при регистрации. Попробуйте снова.")

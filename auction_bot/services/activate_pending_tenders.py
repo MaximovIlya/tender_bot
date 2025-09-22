@@ -43,8 +43,8 @@ async def activate_pending_tenders():
                     tender.current_price = tender.start_price  # Устанавливаем текущую цену
                     await session.commit()
                     logger.info(f"✅ Тендер '{tender.title}' активирован!")
-                    logger.info(f"   📅 Локальное время: {now_local.strftime('%d.%m.%Y %H:%M:%S')}")
-                    logger.info(f"   🌍 UTC время: {now_utc.strftime('%d.%m.%Y %H:%M:%S')}")
+                    logger.info(f"   📅 Локальное время: {now_local.strftime('%d.%м.%Y %H:%M:%S')}")
+                    logger.info(f"   🌍 UTC время: {now_utc.strftime('%d.%м.%Y %H:%M:%S')}")
                     
         except Exception as e:
             logger.error(f"❌ Ошибка в activate_pending_tenders: {e}")

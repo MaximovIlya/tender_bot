@@ -47,20 +47,28 @@ class ReportService:
                 
                 for i, bid in enumerate(bids):
                     participant_name = participant_map.get(bid.supplier_id, "Неизвестно")
+                    from zoneinfo import ZoneInfo
+                    from datetime import timezone as _tz
+                    local_tz = ZoneInfo("Europe/Moscow")
+                    bid_time_local = bid.created_at.astimezone(local_tz) if bid.created_at.tzinfo else bid.created_at.replace(tzinfo=_tz.utc).astimezone(local_tz)
                     report_text += (
                         f"{i+1}. {participant_name}\n"
                         f"   💰 Цена: {bid.amount} ₽\n"
-                        f"   📅 Время: {bid.created_at.strftime('%H:%M:%S')}\n\n"
+                        f"   📅 Время: {bid_time_local.strftime('%H:%M:%S')}\n\n"
                     )
                 
                 # Победитель
                 winner_bid = min(bids, key=lambda x: x.amount)
                 winner = await session.get(User, winner_bid.supplier_id)
+                from zoneinfo import ZoneInfo
+                from datetime import timezone as _tz
+                local_tz = ZoneInfo("Europe/Moscow")
+                winner_time_local = winner_bid.created_at.astimezone(local_tz) if winner_bid.created_at.tzinfo else winner_bid.created_at.replace(tzinfo=_tz.utc).astimezone(local_tz)
                 report_text += (
-                    f"🏆 ПОБЕДИТЕЛЬ:\n"
+                    f"🏆 :\n"
                     f"👤 Организация: {winner.org_name}\n"
                     f"💰 Цена: {winner_bid.amount} ₽\n"
-                    f"📅 Время подачи: {winner_bid.created_at.strftime('%H:%M:%S')}\n"
+                    f"📅 Время подачи: {winner_time_local.strftime('%H:%M:%S')}\n"
                     f"📉 Экономия: {tender.start_price - winner_bid.amount} ₽"
                 )
             else:
@@ -125,11 +133,11 @@ class ReportService:
                         f"   📅 Время: {bid.created_at.strftime('%H:%M:%S')}\n\n"
                     )
                 
-                # Победитель
+                # 
                 winner_bid = min(bids, key=lambda x: x.amount)
                 winner = await session.get(User, winner_bid.supplier_id)
                 report_text += (
-                    f"🏆 ПОБЕДИТЕЛЬ:\n"
+                    f"🏆 :\n"
                     f"👤 Организация: {winner.org_name}\n"
                     f"💰 Цена: {winner_bid.amount} ₽\n"
                     f"📅 Время подачи: {winner_bid.created_at.strftime('%H:%M:%S')}\n"

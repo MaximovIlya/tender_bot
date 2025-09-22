@@ -65,7 +65,11 @@ async def show_profile(message: Message):
         profile_text += f"🆔 Telegram ID: {user.telegram_id}\n"
         profile_text += f"👤 Username: @{user.username or 'Не указан'}\n"
         profile_text += f"🎭 Роль: {role_names.get(user.role, 'Неизвестно')}\n"
-        profile_text += f"📅 Дата регистрации: {user.created_at.strftime('%d.%m.%Y')}\n"
+        from zoneinfo import ZoneInfo
+        from datetime import timezone as _tz
+        local_tz = ZoneInfo("Europe/Moscow")
+        created_local = user.created_at.astimezone(local_tz) if user.created_at.tzinfo else user.created_at.replace(tzinfo=_tz.utc).astimezone(local_tz)
+        profile_text += f"📅 Дата регистрации: {created_local.strftime('%d.%m.%Y')}\n"
         profile_text += f"📊 Статус: {'🚫 Заблокирован' if user.banned else '✅ Активен'}\n"
         
         if user.org_name:

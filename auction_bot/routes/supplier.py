@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime, timedelta
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
@@ -12,11 +13,15 @@ from sqlalchemy.orm import selectinload
 
 from ..db import SessionLocal
 from ..models import User, Tender, TenderStatus, TenderParticipant, Bid, TenderAccess
-from ..keyboards import menu_supplier
+from ..keyboards import menu_participant, menu_supplier_registered
 from ..services.timers import AuctionTimer
 from ..bot import bot
 
-auction_timer = AuctionTimer(bot)
+auction_timer: AuctionTimer | None = None
+
+def set_timer(timer: AuctionTimer):
+    global auction_timer
+    auction_timer = timer
 
 router = Router()
 
@@ -37,6 +42,11 @@ async def show_active_tenders(message: Message):
 
         if not user or not user.org_name:
             await message.answer("Для участия в тендерах необходимо зарегистрироваться.")
+            return
+        
+        # Проверяем, не заблокирован ли пользователь
+        if user.banned:
+            await message.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
             return
 
         # Получаем активные тендеры с учетом доступа (локальное время)
@@ -189,6 +199,68 @@ async def show_active_tenders(message: Message):
 
         await message.answer(response, reply_markup=keyboard)
 
+        # Отправляем прикрепленные файлы условий, если есть
+        tenders_with_files = [t for t in active_tenders + pending_tenders if getattr(t, "conditions_path", None)]
+        for tender in tenders_with_files:
+            try:
+                file_path = tender.conditions_path
+                if file_path and os.path.exists(file_path):
+                    await message.answer_document(
+                        FSInputFile(file_path),
+                        caption=f"📎 Условия тендера: {tender.title}"
+                    )
+            except Exception as e:
+                print(f"Ошибка отправки файла условий для тендера {tender.id}: {e}")
+        
+@router.message(F.text == "Подать заявку")
+async def handle_bid_button(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+
+    async with SessionLocal() as session:
+        stmt = select(User).where(User.telegram_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+
+        if not user:
+            await message.answer("Ошибка: пользователь не найден.")
+            return
+
+        # Ищем активный тендер, где он участвует
+        stmt = (
+            select(TenderParticipant)
+            .where(TenderParticipant.supplier_id == user.id)
+            .order_by(TenderParticipant.id.desc())
+            .limit(1)
+        )
+        result = await session.execute(stmt)
+        participant = result.scalar_one_or_none()
+
+        if not participant:
+            await message.answer("Вы не участвуете ни в одном тендере.")
+            return
+
+        tender = await session.get(Tender, participant.tender_id)
+
+        if not tender or tender.status != TenderStatus.active.value:
+            await message.answer("Дождитесь начала.")
+            return
+
+        # Сохраняем tender_id в state
+        await state.update_data(tender_id=tender.id)
+        await state.set_state(AuctionParticipation.waiting_for_bid)
+        
+        
+        price_str = f"{tender.current_price:,.0f}".replace(",", " ")
+        min_bid_str = f"{tender.min_bid_decrease:,.0f}".replace(",", " ")
+
+        await message.answer(
+            f"💰 Подача заявки в тендер '{tender.title}'\n\n"
+            f"Текущая цена: {price_str} ₽\n"
+            f"Минимальное снижение: {min_bid_str} ₽\n\n"
+            f"Введите вашу цену:"
+        )
+
+
 @router.callback_query(lambda c: c.data.startswith("join_tender_"))
 async def join_tender(callback: CallbackQuery):
     """Присоединение к тендеру"""
@@ -202,6 +274,11 @@ async def join_tender(callback: CallbackQuery):
         
         if not user or not user.org_name:
             await callback.answer("Для участия необходимо зарегистрироваться.")
+            return
+        
+        # Проверяем, не заблокирован ли пользователь
+        if user.banned:
+            await callback.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
             return
         
         tender = await session.get(Tender, tender_id)
@@ -222,15 +299,19 @@ async def join_tender(callback: CallbackQuery):
             return
         
         # Проверяем, не участвует ли уже поставщик
-        stmt = select(TenderParticipant).where(
-            TenderParticipant.tender_id == tender_id,
-            TenderParticipant.supplier_id == user.id
+        stmt = (
+            select(TenderParticipant)
+            .join(Tender, Tender.id == TenderParticipant.tender_id)
+            .where(
+                TenderParticipant.supplier_id == user.id,
+                Tender.status == TenderStatus.active.value
+            )
         )
         result = await session.execute(stmt)
-        existing_participant = result.scalar_one_or_none()
+        active_participation = result.scalar_one_or_none()
 
-        if existing_participant:
-            await callback.answer("Вы уже участвуете в этом тендере.")
+        if active_participation:
+            await callback.message.answer("⚠️ Вы уже участвуете в другом активном тендере. Дождитесь его завершения.")
             return
                 
         # Добавляем участника
@@ -240,6 +321,13 @@ async def join_tender(callback: CallbackQuery):
         )
         session.add(participant)
         await session.commit()
+
+        # Планируем уведомления о скором старте и о начале тендера
+        try:
+            if auction_timer:
+                await auction_timer.schedule_start_notifications(tender.id)
+        except Exception as e:
+            print(f"Не удалось запланировать уведомления для тендера {tender.id}: {e}")
         
         # Создаем клавиатуру с кнопкой подачи заявки
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -249,14 +337,17 @@ async def join_tender(callback: CallbackQuery):
             )]
         ])
         
-        await callback.message.edit_text(
+        price_str = f"{tender.current_price:,.0f}".replace(",", " ")
+        
+        await callback.message.answer(
             f"✅ Вы присоединились к тендеру!\n\n"
             f"📋 {tender.title}\n"
-            f"💰 Текущая цена: {tender.current_price} ₽\n"
+            f"💰 Текущая цена: {price_str} ₽\n"
             f"📅 Начало: {tender.start_at.strftime('%d.%m.%Y %H:%M')}\n\n"
             f"Теперь вы можете подавать заявки на снижение цены.",
-            reply_markup=keyboard
+            reply_markup=menu_participant
         )
+
 
 @router.callback_query(lambda c: c.data.startswith("bid_tender_"))
 async def start_bidding(callback: CallbackQuery, state: FSMContext):
@@ -272,6 +363,11 @@ async def start_bidding(callback: CallbackQuery, state: FSMContext):
         
         if not user or not user.org_name:
             await callback.answer("Для участия необходимо зарегистрироваться.")
+            return
+        
+        # Проверяем, не заблокирован ли пользователь
+        if user.banned:
+            await callback.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
             return
         
         tender = await session.get(Tender, tender_id)
@@ -309,7 +405,7 @@ async def start_bidding(callback: CallbackQuery, state: FSMContext):
             return
         
         
-        
+        await callback.message.edit_reply_markup(reply_markup=None)
         await state.update_data(tender_id=tender_id)
         await state.set_state(AuctionParticipation.waiting_for_bid)
         
@@ -388,6 +484,15 @@ async def process_bid(message: Message, state: FSMContext):
             )
             return
         
+        max_decrease = tender.current_price * 0.1
+        if tender.current_price - bid_amount > max_decrease:
+            await message.answer(
+                f"Вы снизили цену более чем на 10% от текущей. Возможно вы ошиблись\n"
+                f"Текущая цена: {tender.current_price} ₽\n"
+                f"Попробуйте снова:"
+            )
+            return
+        
         # Создаем заявку
         bid = Bid(
             tender_id=tender_id,
@@ -402,7 +507,8 @@ async def process_bid(message: Message, state: FSMContext):
         
         await session.commit()
 
-        await auction_timer.reset_timer_for_tender(tender.id)
+        if auction_timer:
+            await auction_timer.reset_timer_for_tender(tender.id)
         
         # Получаем пользователя для уведомлений
         stmt = select(User).where(User.telegram_id == user_id)
@@ -412,13 +518,18 @@ async def process_bid(message: Message, state: FSMContext):
         # Уведомляем всех участников о новой заявке
         await notify_participants_about_bid(session, tender, bid, user)
         
+        price_str = f"{bid_amount:,.0f}".replace(",", " ")
+        start_price_str = f"{tender.start_price:,.0f}".replace(",", " ")
+        
+        
         await message.answer(
             f"✅ Заявка подана!\n\n"
             f"📋 Тендер: {tender.title}\n"
-            f"💰 Ваша цена: {bid_amount} ₽\n"
+            f"💰 Начальная цена: {start_price_str} ₽\n"
+            f"💰 Ваша цена: {price_str} ₽\n"
             f"📅 Время подачи: {tender.last_bid_at.strftime('%H:%M:%S')}\n\n"
             f"Аукцион продолжается!",
-            reply_markup=menu_supplier
+            reply_markup=menu_participant
         )
     
     await state.clear()
@@ -437,11 +548,16 @@ async def notify_participants_about_bid(session: AsyncSession, tender: Tender, b
             participant_number = i + 1
             break
     
+    amount_str = f"{bid.amount:,.0f}".replace(",", " ")
+    from zoneinfo import ZoneInfo
+    from datetime import timezone as _tz
+    local_tz = ZoneInfo("Europe/Moscow")
+    created_local = bid.created_at.replace(tzinfo=_tz.utc).astimezone(local_tz) if bid.created_at.tzinfo is None else bid.created_at.astimezone(local_tz)
     notification_text = (
         f"🔥 Новая заявка в тендере '{tender.title}'!\n\n"
         f"👤 Участник {participant_number}\n"
-        f"💰 Цена: {bid.amount} ₽\n"
-        f"📅 Время: {bid.created_at.strftime('%H:%M:%S')}\n\n"
+        f"💰 Цена: {amount_str} ₽\n"
+        f"📅 Время: {created_local.strftime('%H:%M:%S')}\n\n"
         f"Текущая цена: {tender.current_price} ₽"
     )
     
@@ -475,6 +591,11 @@ async def debug_tenders(message: Message):
         
         if not user or not user.org_name:
             await message.answer("Для участия в тендерах необходимо зарегистрироваться.")
+            return
+        
+        # Проверяем, не заблокирован ли пользователь
+        if user.banned:
+            await message.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
             return
         
         # Получаем текущее время в UTC и локальное время
@@ -518,12 +639,16 @@ async def debug_tenders(message: Message):
                 tender.start_at <= now_local
             )
             
+            from zoneinfo import ZoneInfo
+            from datetime import timezone as _tz
+            local_tz = ZoneInfo("Europe/Moscow")
+            created_local = tender.created_at.replace(tzinfo=_tz.utc).astimezone(local_tz) if tender.created_at and tender.created_at.tzinfo is None else (tender.created_at.astimezone(local_tz) if tender.created_at else None)
             response += (
                 f"{status_emoji} <b>{tender.title}</b>\n"
                 f"   ID: {tender.id}\n"
                 f"   Статус: {status_text}\n"
                 f"   Время начала: {tender.start_at.strftime('%d.%m.%Y %H:%M:%S') if tender.start_at else 'Не указано'}\n"
-                f"   Создан: {tender.created_at.strftime('%d.%m.%Y %H:%M:%S')}\n"
+                f"   Создан: {created_local.strftime('%d.%m.%Y %H:%M:%S') if created_local else 'Не указано'}\n"
             )
             
             if should_be_active:
@@ -531,7 +656,7 @@ async def debug_tenders(message: Message):
             
             response += "\n"
         
-        await message.answer(response, reply_markup=menu_supplier)
+        await message.answer(response, reply_markup=menu_supplier_registered)
 
 @router.message(Command("force_activate"))
 async def force_activate_tenders(message: Message):
@@ -546,6 +671,11 @@ async def force_activate_tenders(message: Message):
         
         if not user or not user.org_name:
             await message.answer("Для участия в тендерах необходимо зарегистрироваться.")
+            return
+        
+        # Проверяем, не заблокирован ли пользователь
+        if user.banned:
+            await message.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
             return
         
         # Получаем текущее время в UTC и локальное время
@@ -577,7 +707,7 @@ async def force_activate_tenders(message: Message):
         await session.commit()
         response += f"\n🎉 Активировано тендеров: {len(pending_tenders)}"
         
-        await message.answer(response, reply_markup=menu_supplier)
+        await message.answer(response, reply_markup=menu_supplier_registered)
 
 @router.message(Command("my_bids"))
 async def show_my_bids(message: Message):
@@ -594,6 +724,11 @@ async def show_my_bids(message: Message):
             await message.answer("Для участия в тендерах необходимо зарегистрироваться.")
             return
         
+        # Проверяем, не заблокирован ли пользователь
+        if user.banned:
+            await message.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
+            return
+        
         # Получаем заявки пользователя
         stmt = select(Bid).where(Bid.supplier_id == user.id).order_by(Bid.created_at.desc())
         result = await session.execute(stmt)
@@ -607,14 +742,18 @@ async def show_my_bids(message: Message):
         for bid in bids:
             tender = await session.get(Tender, bid.tender_id)
             if tender:
+                from zoneinfo import ZoneInfo
+                from datetime import timezone as _tz
+                local_tz = ZoneInfo("Europe/Moscow")
+                created_local = bid.created_at.replace(tzinfo=_tz.utc).astimezone(local_tz) if bid.created_at.tzinfo is None else bid.created_at.astimezone(local_tz)
                 response += (
                     f"📋 {tender.title}\n"
                     f"💰 Цена: {bid.amount} ₽\n"
-                    f"📅 Время: {bid.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+                    f"📅 Время: {created_local.strftime('%d.%m.%Y %H:%M')}\n"
                     f"📊 Статус тендера: {tender.status}\n\n"
                 )
         
-        await message.answer(response, reply_markup=menu_supplier)
+        await message.answer(response, reply_markup=menu_supplier_registered)
 
 def register_handlers(dp):
     """Регистрация хендлеров"""

@@ -1,18 +1,25 @@
 import asyncio
 from datetime import datetime, timedelta
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, FSInputFile, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, FSInputFile, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton, reply_keyboard_markup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters import Command
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from . import organizer
 
 from ..db import SessionLocal
 from ..models import User, Tender, TenderStatus, TenderParticipant, TenderAccess
 from ..keyboards import menu_organizer
 from ..services.timers import AuctionTimer
+auction_timer: AuctionTimer | None = None
+
+def set_timer(timer: AuctionTimer):
+    global auction_timer
+    auction_timer = timer
+
 
 router = Router()
 
@@ -40,6 +47,11 @@ async def start_tender_creation(message: Message, state: FSMContext):
         user = result.scalar_one_or_none()
         if not user or user.role != "organizer":
             await message.answer("У вас нет прав для создания тендеров.")
+            return
+        
+        # Проверяем, не заблокирован ли пользователь
+        if user.banned:
+            await message.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
             return
     
     await state.set_state(TenderCreation.waiting_for_title)
@@ -81,6 +93,44 @@ async def process_tender_price(message: Message, state: FSMContext):
         "Введите дату и время начала аукциона в формате ДД.ММ.ГГГГ ЧЧ:ММ\n"
         "Например: 25.12.2024 14:00"
     )
+    
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+async def notify_admins_about_new_tender(tender: Tender, bot):
+    """Отправка уведомления админам о новом тендере с кнопкой подтверждения"""
+    async with SessionLocal() as session:
+        stmt = select(User).where(User.role == "admin")
+        result = await session.execute(stmt)
+        admins = result.scalars().all()
+        
+        if not admins:
+            print("Нет администраторов для уведомления.")
+            return
+
+        # Формируем клавиатуру с кнопкой подтверждения
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Одобрить тендер",
+                    callback_data=f"approve_tender_{tender.id}"  # сюда идёт ID тендера
+                )
+            ]
+        ])
+
+        for admin in admins:
+            await bot.send_message(
+                admin.telegram_id,
+                f"📢 Новый тендер ожидает подтверждения:\n\n"
+                f"📋 Название: {tender.title}\n"
+                f"💰 Стартовая цена: {tender.start_price} ₽\n"
+                f"📅 Дата начала: {tender.start_at.strftime('%d.%m.%Y %H:%M')}\n"
+                f"📝 Описание: {tender.description}",
+                reply_markup=keyboard
+            )
+
+        
+        
+
 
 @router.message(TenderCreation.waiting_for_start_date)
 async def process_tender_date(message: Message, state: FSMContext):
@@ -104,32 +154,35 @@ async def process_tender_date(message: Message, state: FSMContext):
     )
 
 @router.message(TenderCreation.waiting_for_conditions)
+@router.message(TenderCreation.waiting_for_conditions)
 async def process_tender_conditions(message: Message, state: FSMContext):
-    """Обработка условий тендера"""
+    """Обработка условий тендера (файл или 'нет')"""
     user_data = await state.get_data()
     user_id = message.from_user.id
-    
+
     conditions_path = None
     if message.document:
-        # Сохраняем файл
-        file_path = f"files/tender_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        # Получаем расширение файла
+        ext = message.document.file_name.split('.')[-1]
+        file_path = f"files/tender_{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{ext}"
+        
+        # Скачиваем файл
         await message.bot.download(message.document, file_path)
         conditions_path = file_path
     elif message.text.strip().lower() != "нет":
-        await message.answer("Отправьте файл или напишите 'нет':")
-        return
-
+        await message.answer("Отправьте файл с условиями или напишите 'нет':")
+        return  # ждем корректный ввод
     
-    # Создаем тендер
+    # Создание тендера
     async with SessionLocal() as session:
         stmt = select(User).where(User.telegram_id == user_id)
         result = await session.execute(stmt)
         user = result.scalar_one_or_none()
-    
+
         if not user:
             await message.answer("❌ Пользователь не найден в базе. Попробуйте заново.")
             return
-        
+
         tender = Tender(
             title=user_data['title'],
             description=user_data['description'],
@@ -138,23 +191,29 @@ async def process_tender_conditions(message: Message, state: FSMContext):
             start_at=user_data['start_at'],
             conditions_path=conditions_path,
             organizer_id=user.id,
-            status=TenderStatus.draft.value  
+            status=TenderStatus.draft.value
         )
-                
+
         session.add(tender)
         await session.commit()
-        
+
+        # Уведомление админов о новом тендере
+        await notify_admins_about_new_tender(tender, message.bot)
+        await auction_timer.schedule_start_notifications(tender.id)
+
+        price_str = f"{tender.start_price:,.0f}".replace(",", " ")
         await message.answer(
             f"✅ Тендер успешно создан!\n\n"
             f"📋 Название: {tender.title}\n"
-            f"💰 Стартовая цена: {tender.start_price} ₽\n"
+            f"💰 Стартовая цена: {price_str} ₽\n"
             f"📅 Дата начала: {tender.start_at.strftime('%d.%m.%Y %H:%M')}\n"
             f"📝 Описание: {tender.description}\n\n"
             f"Тендер будет активен с {tender.start_at.strftime('%d.%m.%Y %H:%M')}",
             reply_markup=menu_organizer
         )
-    
+
     await state.clear()
+
 
 
 
@@ -172,11 +231,19 @@ async def show_my_tenders(message: Message):
         if not user or user.role != "organizer":
             await message.answer("У вас нет прав для просмотра тендеров.")
             return
+        
+        # Проверяем, не заблокирован ли пользователь
+        if user.banned:
+            await message.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
+            return
 
-        # Получаем тендеры организатора сразу с участниками и заявками
+        # Получаем только активные тендеры организатора (исключаем завершенные)
         stmt = (
             select(Tender)
-            .where(Tender.organizer_id == user.id)
+            .where(
+                Tender.organizer_id == user.id,
+                Tender.status != TenderStatus.closed.value
+            )
             .options(
                 selectinload(Tender.participants),
                 selectinload(Tender.bids),
@@ -192,7 +259,11 @@ async def show_my_tenders(message: Message):
 
         # Формируем ответ
         response = "📋 Ваши тендеры:\n\n"
+        from zoneinfo import ZoneInfo
+        from datetime import timezone as _tz
+        local_tz = ZoneInfo("Europe/Moscow")
         for tender in tenders:
+            created_local = tender.created_at.replace(tzinfo=_tz.utc).astimezone(local_tz) if tender.created_at and tender.created_at.tzinfo is None else (tender.created_at.astimezone(local_tz) if tender.created_at else None)
             status_emoji = {
                 "draft": "📝",
                 "active": "🟢",
@@ -211,6 +282,75 @@ async def show_my_tenders(message: Message):
 
         await message.answer(response, reply_markup=menu_organizer)
 
+@router.message(F.text == "История")
+async def show_tender_history(message: Message):
+    """Показать историю завершенных тендеров организатора"""
+    user_id = message.from_user.id
+
+    async with SessionLocal() as session:
+        # Находим пользователя по telegram_id
+        stmt = select(User).where(User.telegram_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+
+        if not user or user.role != "organizer":
+            await message.answer("У вас нет прав для просмотра истории тендеров.")
+            return
+        
+        # Проверяем, не заблокирован ли пользователь
+        if user.banned:
+            await message.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
+            return
+
+        # Получаем только завершенные тендеры организатора
+        stmt = (
+            select(Tender)
+            .where(
+                Tender.organizer_id == user.id,
+                Tender.status == TenderStatus.closed.value
+            )
+            .options(
+                selectinload(Tender.participants),
+                selectinload(Tender.bids),
+            )
+            .order_by(Tender.created_at.desc())
+        )
+        result = await session.execute(stmt)
+        closed_tenders = result.scalars().all()
+
+        if not closed_tenders:
+            await message.answer("У вас пока нет завершенных тендеров.", reply_markup=menu_organizer)
+            return
+
+        # Формируем ответ
+        response = "📚 История завершенных тендеров:\n\n"
+        for tender in closed_tenders:
+            from zoneinfo import ZoneInfo
+            from datetime import timezone as _tz
+            local_tz = ZoneInfo("Europe/Moscow")
+            created_local = tender.created_at.astimezone(local_tz) if tender.created_at.tzinfo else tender.created_at.replace(tzinfo=_tz.utc).astimezone(local_tz)
+            
+            # Находим победителя (самую низкую ставку)
+            winner_info = ""
+            if tender.bids:
+                winner_bid = min(tender.bids, key=lambda x: x.amount)
+                winner = await session.get(User, winner_bid.supplier_id)
+                if winner:
+                    winner_info = f"🏆 Победитель: {winner.org_name} ({winner_bid.amount:,.0f} ₽)"
+
+            response += (
+                f"🔴 <b>{tender.title}</b>\n"
+                f"💰 Стартовая цена: {tender.start_price:,.0f} ₽\n"
+                f"💰 Финальная цена: {tender.current_price:,.0f} ₽\n"
+                f"📅 Дата начала: {tender.start_at.strftime('%d.%m.%Y %H:%M')}\n"
+                f"📅 Создан: {created_local.strftime('%d.%m.%Y %H:%M')}\n"
+                f"🏆 Участников: {len(tender.participants)}\n"
+                f"📈 Заявок: {len(tender.bids)}\n"
+                f"{winner_info}\n\n"
+            )
+
+        await message.answer(response, reply_markup=menu_organizer)
+
 @router.message(Command("start_auction"))
 async def start_auction(message: Message):
     """Запуск аукциона"""
@@ -220,6 +360,11 @@ async def start_auction(message: Message):
         user = await session.get(User, user_id)
         if not user or user.role != "organizer":
             await message.answer("У вас нет прав для запуска аукционов.")
+            return
+        
+        # Проверяем, не заблокирован ли пользователь
+        if user.banned:
+            await message.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
             return
         
         # Получаем черновики тендеров
@@ -289,12 +434,21 @@ async def start_access_management(message: Message, state: FSMContext):
             await message.answer("У вас нет прав для управления доступом к тендерам.")
             return
         
+        # Проверяем, не заблокирован ли пользователь
+        if user.banned:
+            await message.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
+            return
+        
         # Получаем тендеры организатора
         stmt = (
             select(Tender)
-            .where(Tender.organizer_id == user.id)
+            .where(
+                Tender.organizer_id == user.id,
+                Tender.status != TenderStatus.closed.value   # исключаем закрытые
+            )
             .order_by(Tender.created_at.desc())
         )
+
         result = await session.execute(stmt)
         tenders = result.scalars().all()
         
@@ -330,6 +484,11 @@ async def manage_tender_access(callback: CallbackQuery, state: FSMContext = None
         user = result.scalar_one_or_none()
         if not user or user.role != "organizer":
             await callback.answer("У вас нет прав для управления доступом.")
+            return
+        
+        # Проверяем, не заблокирован ли пользователь
+        if user.banned:
+            await callback.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
             return
         
         # Получаем тендер
@@ -405,6 +564,11 @@ async def toggle_supplier_access(callback: CallbackQuery):
         user = result.scalar_one_or_none()
         if not user or user.role != "organizer":
             await callback.answer("У вас нет прав для управления доступом.")
+            return
+        
+        # Проверяем, не заблокирован ли пользователь
+        if user.banned:
+            await callback.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
             return
         
         # Получаем тендер
