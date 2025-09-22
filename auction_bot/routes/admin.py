@@ -345,7 +345,7 @@ async def process_approve_tender(callback: CallbackQuery):
 
     await callback.message.edit_text(f"✅ Тендер '{tender.title}' одобрен! Он будет активирован в {tender.start_at.strftime('%d.%m.%Y %H:%M')}")
 
-@router.message(F.text == "История")
+@router.message(F.text == "История всех тендеров")
 async def show_admin_history(message: Message):
     """Показать историю всех завершенных тендеров для админа"""
     user_id = message.from_user.id
@@ -358,7 +358,7 @@ async def show_admin_history(message: Message):
         # Получаем все завершенные тендеры
         stmt = (
             select(Tender)
-            .where(Tender.status == TenderStatus.closed.value)
+            .where(Tender.status.in_([TenderStatus.closed.value, TenderStatus.cancelled.value]))
             .options(
                 selectinload(Tender.participants),
                 selectinload(Tender.bids),
@@ -392,9 +392,13 @@ async def show_admin_history(message: Message):
                 if winner:
                     winner_info = f"🏆 Победитель: {winner.org_name} ({winner_bid.amount:,.0f} ₽)"
 
+            status_text = {
+                TenderStatus.closed.value: "Завершён",
+                "cancelled": "Отменён"
+            }.get(tender.status, "Неизвестно")
+            
             response += (
-                f"🔴 <b>{tender.title}</b>\n"
-                f"👤 Организатор: {organizer_name}\n"
+                f"🔴 <b>{tender.title}</b> — {status_text}\n"
                 f"💰 Стартовая цена: {tender.start_price:,.0f} ₽\n"
                 f"💰 Финальная цена: {tender.current_price:,.0f} ₽\n"
                 f"📅 Дата начала: {tender.start_at.strftime('%d.%m.%Y %H:%M')}\n"

@@ -20,6 +20,9 @@ def set_timer(timer: AuctionTimer):
     global auction_timer
     auction_timer = timer
 
+def format_price(value: float | int) -> str:
+        return f"{value:,.0f}".replace(",", " ")
+
 
 router = Router()
 
@@ -122,7 +125,7 @@ async def notify_admins_about_new_tender(tender: Tender, bot):
                 admin.telegram_id,
                 f"📢 Новый тендер ожидает подтверждения:\n\n"
                 f"📋 Название: {tender.title}\n"
-                f"💰 Стартовая цена: {tender.start_price} ₽\n"
+                f"💰 Стартовая цена: {format_price(tender.start_price)} ₽\n"
                 f"📅 Дата начала: {tender.start_at.strftime('%d.%m.%Y %H:%M')}\n"
                 f"📝 Описание: {tender.description}",
                 reply_markup=keyboard
@@ -214,8 +217,114 @@ async def process_tender_conditions(message: Message, state: FSMContext):
 
     await state.clear()
 
+@router.message(F.text == "Удалить тендер")
+async def delete_tender(message: Message):
+    """Выбор тендера для удаления"""
+    user_id = message.from_user.id
+
+    async with SessionLocal() as session:
+        # Проверяем, что это организатор
+        stmt = select(User).where(User.telegram_id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        if not user or user.role != "organizer":
+            await message.answer("У вас нет прав для удаления тендеров.")
+            return
+
+        if user.banned:
+            await message.answer("Ваш аккаунт заблокирован. Обратитесь к администратору.")
+            return
+
+        # Получаем тендеры, которые ещё не начались
+        stmt = select(Tender).where(
+            Tender.organizer_id == user.id,
+            Tender.start_at > datetime.now(),
+            Tender.status.in_([TenderStatus.draft.value, TenderStatus.active.value])
+        ).order_by(Tender.start_at.asc())
+
+        result = await session.execute(stmt)
+        tenders = result.scalars().all()
+
+        if not tenders:
+            await message.answer("❌ У вас нет тендеров, которые можно удалить.")
+            return
+
+        # Клавиатура с выбором
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"{t.title} ({t.start_at.strftime('%d.%m.%Y %H:%M')})",
+                callback_data=f"confirm_delete_{t.id}"
+            )] for t in tenders
+        ])
+
+        await message.answer("Выберите тендер для удаления:", reply_markup=keyboard)
 
 
+@router.callback_query(lambda c: c.data.startswith("confirm_delete_"))
+async def confirm_delete_tender(callback: CallbackQuery):
+    """Подтверждение удаления"""
+    tender_id = int(callback.data.split("_")[2])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"delete_tender_{tender_id}"),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_delete")
+        ]
+    ])
+
+    await callback.message.edit_text(
+        "Вы уверены, что хотите удалить этот тендер? Действие необратимо.",
+        reply_markup=keyboard
+    )
+
+
+@router.callback_query(lambda c: c.data.startswith("delete_tender_"))
+async def delete_tender_confirmed(callback: CallbackQuery):
+    tender_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+
+    async with SessionLocal() as session:
+        tender = await session.get(
+            Tender,
+            tender_id,
+            options=[selectinload(Tender.organizer)]
+        )
+
+        if not tender:
+            await callback.answer("❌ Тендер не найден.")
+            return
+
+        if tender.organizer.telegram_id != user_id:
+            await callback.answer("❌ У вас нет прав на удаление этого тендера.")
+            return
+
+        if tender.start_at <= datetime.now():
+            await callback.answer("❌ Этот тендер уже начался, его нельзя удалить.")
+            return
+
+        # отменяем таймер и уведомления
+        if auction_timer:
+            await auction_timer.cancel_timer_for_tender(tender.id)
+            await auction_timer.cancel_start_notifications(tender.id)
+
+        if tender and tender.organizer.telegram_id == user_id:
+            tender.status = "cancelled"
+       
+            await session.commit()
+
+    await callback.message.edit_text("✅ Тендер успешно удалён.")
+    await callback.message.answer(
+        reply_markup=menu_organizer  # тут ReplyKeyboardMarkup
+    )
+
+
+
+
+
+@router.callback_query(F.data == "cancel_delete")
+async def cancel_delete(callback: CallbackQuery):
+    """Отмена удаления"""
+    await callback.message.edit_text("Удаление отменено.", reply_markup=menu_organizer)
 
 @router.message(F.text == "Мои тендеры")
 async def show_my_tenders(message: Message):
@@ -242,7 +351,7 @@ async def show_my_tenders(message: Message):
             select(Tender)
             .where(
                 Tender.organizer_id == user.id,
-                Tender.status != TenderStatus.closed.value
+                Tender.status.not_in([TenderStatus.closed.value, TenderStatus.cancelled.value])
             )
             .options(
                 selectinload(Tender.participants),
@@ -273,7 +382,7 @@ async def show_my_tenders(message: Message):
 
             response += (
                 f"{status_emoji.get(tender.status, '❓')} <b>{tender.title}</b>\n"
-                f"💰 Цена: {tender.current_price} ₽\n"
+                f"💰 Цена: {format_price(tender.current_price)} ₽\n"
                 f"📅 Дата: {tender.start_at.strftime('%d.%m.%Y %H:%M') if tender.start_at else 'Не указана'}\n"
                 f"📊 Статус: {tender.status}\n"
                 f"🏆 Участников: {len(tender.participants)}\n"
@@ -307,7 +416,7 @@ async def show_tender_history(message: Message):
             select(Tender)
             .where(
                 Tender.organizer_id == user.id,
-                Tender.status == TenderStatus.closed.value
+                Tender.status.in_([TenderStatus.closed.value, TenderStatus.cancelled.value])
             )
             .options(
                 selectinload(Tender.participants),
@@ -315,6 +424,7 @@ async def show_tender_history(message: Message):
             )
             .order_by(Tender.created_at.desc())
         )
+
         result = await session.execute(stmt)
         closed_tenders = result.scalars().all()
 
@@ -338,10 +448,14 @@ async def show_tender_history(message: Message):
                 if winner:
                     winner_info = f"🏆 Победитель: {winner.org_name} ({winner_bid.amount:,.0f} ₽)"
 
+            status_text = {
+                TenderStatus.closed.value: "Завершён",
+                "cancelled": "Отменён"
+            }.get(tender.status, "Неизвестно")
             response += (
-                f"🔴 <b>{tender.title}</b>\n"
-                f"💰 Стартовая цена: {tender.start_price:,.0f} ₽\n"
-                f"💰 Финальная цена: {tender.current_price:,.0f} ₽\n"
+                f"🔴 <b>{tender.title}</b> — {status_text}\n"
+                f"💰 Стартовая цена: {format_price(tender.start_price)} ₽\n"
+                f"💰 Финальная цена: {format_price(tender.current_price)} ₽\n"
                 f"📅 Дата начала: {tender.start_at.strftime('%d.%m.%Y %H:%M')}\n"
                 f"📅 Создан: {created_local.strftime('%d.%m.%Y %H:%M')}\n"
                 f"🏆 Участников: {len(tender.participants)}\n"
@@ -416,7 +530,7 @@ async def process_start_tender(callback: CallbackQuery):
         await callback.message.edit_text(
             f"✅ Аукцион запущен!\n\n"
             f"📋 {tender.title}\n"
-            f"💰 Стартовая цена: {tender.start_price} ₽\n"
+            f"💰 Стартовая цена: {format_price(tender.start_price)} ₽\n"
             f"📅 Начало: {tender.start_at.strftime('%d.%m.%Y %H:%M')}\n\n"
             f"Поставщики могут подавать заявки!"
         )

@@ -16,13 +16,13 @@ menu_supplier_registered = ReplyKeyboardMarkup(keyboard=[
 
 menu_organizer = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="Создать тендер"), KeyboardButton(text="Мои тендеры")],
-    [KeyboardButton(text="История"), KeyboardButton(text="Управление доступом")],
+    [KeyboardButton(text="История"), KeyboardButton(text="Управление доступом"), KeyboardButton(text="Удалить тендер")],
 ], resize_keyboard=True)
 
 
 menu_admin = ReplyKeyboardMarkup(keyboard=[
     [KeyboardButton(text="Пользователи"), KeyboardButton(text="Одобрить тендер")],
-    [KeyboardButton(text="Статус тендеров"), KeyboardButton(text="История")],
+    [KeyboardButton(text="Статус тендеров"), KeyboardButton(text="История всех тендеров")],
 ], resize_keyboard=True)
 
 

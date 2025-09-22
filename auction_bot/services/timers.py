@@ -290,6 +290,29 @@ class AuctionTimer:
                     except Exception as e:
                         logger.error(f"Failed to send notification to user {user.id}: {e}")
 
+    async def cancel_start_notifications(self, tender_id: int):
+        """Отмена уведомлений (10 мин и старт) для тендера"""
+        if tender_id in self.start_notifications:
+            for key, task in self.start_notifications[tender_id].items():
+                if task and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    logger.info(f"⏹ Уведомление '{key}' для тендера {tender_id} отменено")
+            self.start_notifications.pop(tender_id, None)
+
+    async def cleanup(self):
+        """Очистка всех таймеров и уведомлений"""
+        # таймеры аукционов
+        for tender_id in list(self.active_timers.keys()):
+            await self.cancel_timer_for_tender(tender_id)
+        # уведомления о старте
+        for tender_id in list(self.start_notifications.keys()):
+            await self.cancel_start_notifications(tender_id)
+        logger.info("Все таймеры и уведомления очищены")
+
     async def reset_timer_for_tender(self, tender_id: int):
         if tender_id in self.active_timers:
             self.active_timers[tender_id].cancel()

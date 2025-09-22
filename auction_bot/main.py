@@ -8,6 +8,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.types import BotCommand
 
 from .config import settings
 from .db import init_db, SessionLocal
@@ -228,7 +229,13 @@ def register_handlers(dp: Dispatcher):
 
 async def main():
     """Главная функция"""
+
+    await bot.delete_webhook(drop_pending_updates=True)
     # Инициализация базы данных
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Запуск бота"),
+        BotCommand(command="help", description="Помощь"),
+    ])
     await init_db()
     
     
